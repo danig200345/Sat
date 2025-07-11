@@ -1,169 +1,134 @@
-
+// file: services/satClient.js
 import {
-    Fiel,
-    Service,
-    QueryParameters,
-    RequestType,
-    DownloadType,
-    HttpsWebClient,
-    FielRequestBuilder,
-    DateTimePeriod,
-    RfcMatch
+    Fiel, Service, HttpsWebClient, FielRequestBuilder, ServiceEndpoints,
+    QueryParameters, DateTimePeriod, RequestType, DownloadType, RfcMatch, DocumentType, DocumentStatus
 } from '@nodecfdi/sat-ws-descarga-masiva';
+import { pool } from '../db/database.js';
+import forge from 'node-forge';
 
-import dotenv from 'dotenv';
-import jwt from 'jsonwebtoken';
+export const sessionCache = new Map();
 
-dotenv.config();
+/**
+ * En el login, creamos y cacheamos DOS instancias de servicio:
+ * una para CFDI regulares y otra para Retenciones.
+ */
+export async function createSession(files, password) {
+    if (!files || !files.cer || !files.key) throw new Error('Debes proporcionar los archivos .cer y .key.');
+    if (!password) throw new Error('Debes proporcionar la contraseña de la FIEL.');
 
+    const cerBuffer = files.cer[0].buffer;
+    const keyBuffer = files.key[0].buffer;
 
+    const fiel = Fiel.create(cerBuffer.toString('binary'), keyBuffer.toString('binary'), password);
+    if (!fiel.isValid()) throw new Error('La e.firma es inválida, ha expirado o la contraseña es incorrecta.');
 
-export const credencialesCache = new Map();
-
-export async function login(files, password) {
-    if (!files.cer || !files.key) {
-        throw new Error('Debes proporcionar los archivos .cer y .key.');
-    }
-    console.log("[LOG] Iniciando proceso con '@nodecfdi/sat-ws-descarga-masiva'...");
-
-
-    const fiel = Fiel.create(
-        files.cer[0].buffer.toString('binary'),
-        files.key[0].buffer.toString('binary'),
-        password
-    );
-
-    // 2. Validar la e.firma
-    if (!fiel.isValid()) {
-        throw new Error('La e.firma es inválida o la contraseña es incorrecta.');
-    }
     const rfc = fiel.getRfc();
-    console.log(`[LOG] RFC extraído: ${rfc}`);
+    let certificateData = { rfc, serialNumber: null, razonSocial: rfc, validFrom: null, validTo: null };
+    try {
+        const pki = forge.pki;
+        const cert = pki.certificateFromAsn1(forge.asn1.fromDer(cerBuffer.toString('binary')));
+        certificateData.serialNumber = cert.serialNumber;
+        certificateData.validFrom = cert.validity.notBefore;
+        certificateData.validTo = cert.validity.notAfter;
+        let potentialNames = [];
+        for (const field of cert.subject.attributes) {
+            const rfcRegex = /^[A-Z&Ñ]{3,4}[0-9]{2}(0[1-9]|1[0-2])(0[1-9]|[12][0-9]|3[01])[A-Z0-9]{2}[A0-9]$/;
+            if (typeof field.value === 'string' && !rfcRegex.test(field.value.toUpperCase()) && field.value.toUpperCase() !== 'SAT') {
+                potentialNames.push(field.value);
+            }
+        }
+        if (potentialNames.length > 0) {
+            certificateData.razonSocial = potentialNames.reduce((a, b) => a.length > b.length ? a : b);
+        }
+    } catch (e) {
+        console.warn("Advertencia: No se pudieron extraer los detalles adicionales del certificado.", e.message);
+    }
 
-    // 3. Crear los componentes del servicio
+    try {
+        await pool.execute(`INSERT INTO users (rfc, razon_social) VALUES (?, ?) ON DUPLICATE KEY UPDATE razon_social = VALUES(razon_social)`, [certificateData.rfc, certificateData.razonSocial]);
+        if (certificateData.serialNumber && certificateData.validFrom && certificateData.validTo) {
+            await pool.execute(`INSERT INTO fiels (user_rfc, serial_number, valid_from, valid_to) VALUES (?, ?, ?, ?) ON DUPLICATE KEY UPDATE valid_from = VALUES(valid_from), valid_to = VALUES(valid_to), status = 'activa'`, [certificateData.rfc, certificateData.serialNumber, certificateData.validFrom, certificateData.validTo]);
+        }
+    } catch (err) {
+        throw new Error('Error al registrar al usuario en la base de datos.');
+    }
+
     const webClient = new HttpsWebClient();
     const requestBuilder = new FielRequestBuilder(fiel);
-    const service = new Service(requestBuilder, webClient);
 
-    // Guardamos la instancia de 'service' en caché usando el RFC como clave
-    credencialesCache.set(rfc, service);
+    // --- ARQUITECTURA DUAL ---
+    console.log('[SAT Client] Creando instancia de servicio para CFDI Regulares...');
+    const cfdiService = new Service(requestBuilder, webClient, undefined, ServiceEndpoints.cfdi());
+    console.log('[SAT Client] Creando instancia de servicio para Retenciones...');
+    const retencionesService = new Service(requestBuilder, webClient, undefined, ServiceEndpoints.retenciones());
 
-    console.log('[LOG] Instancia de servicio creada exitosamente.');
-    return { token: rfc, rfc: rfc };
+    // Guardamos ambos servicios en la caché, identificados por un sufijo.
+    sessionCache.set(`${rfc}_cfdi`, cfdiService);
+    sessionCache.set(`${rfc}_retenciones`, retencionesService);
+
+    return { rfc };
 }
 
-export async function solicitarDescarga(token, params) {
-    const service = credencialesCache.get(token);
-    if (!service) {
-        throw new Error('Sesión no encontrada. Por favor, autentíquese de nuevo.');
-    }
+/**
+ * Función de solicitud flexible que usa el servicio correcto
+ * basándose en los parámetros del usuario.
+ */
+export async function solicitarDescarga(service, params) {
+    const { fechaInicio, fechaFin, tipo, requestType, documentType, rfcEmisor, rfcReceptor } = params;
+    let query = QueryParameters.create(DateTimePeriod.createFromValues(fechaInicio, fechaFin));
 
-    const { fechaInicio, fechaFin, tipo, requestType, rfcEmisor, rfcReceptor } = params;
+    if (tipo === 'Recibidos') { query = query.withDownloadType(new DownloadType('received')); }
+    else { query = query.withDownloadType(new DownloadType('issued')); }
 
-    // Crear parámetros de consulta con el periodo de fechas
-    // El formato esperado es 'YYYY-MM-DD HH:mm:ss'
-    const period = DateTimePeriod.createFromValues(fechaInicio, fechaFin);
-    const parameters = QueryParameters.create(period);
-
-    // Definir tipo de descarga (Emitidos o Recibidos)
-    if (tipo === 'Recibidos') {
-        parameters.setDownloadType(DownloadType.received());
-        // En recibidos, se puede filtrar por el RFC del emisor
-        if (rfcEmisor) {
-            parameters.setRfcMatch(RfcMatch.create(rfcEmisor));
-        }
-    } else { // 'Emitidos'
-        parameters.setDownloadType(DownloadType.issued());
-        // En emitidos, se puede filtrar por el RFC del receptor
-        if (rfcReceptor) {
-            parameters.setRfcMatch(RfcMatch.create(rfcReceptor));
-        }
-    }
-
-    // Definir tipo de solicitud (Metadata o XML de los CFDI)
     if (requestType === 'CFDI') {
-        parameters.setRequestType(RequestType.xml());
-    } else { // 'Metadata' por defecto
-        parameters.setRequestType(RequestType.metadata());
+        query = query.withRequestType(new RequestType('xml'));
+        query = query.withDocumentStatus(new DocumentStatus('active'));
+    } else { query = query.withRequestType(new RequestType('metadata')); }
+
+    if (documentType) {
+        query = query.withDocumentType(new DocumentType(documentType.toLowerCase()));
     }
 
-    console.log('[LOG] Solicitando descarga con parámetros:', JSON.stringify(parameters.jsonSerialize(), null, 2));
-    const result = await service.query(parameters);
+    const rfcContraparte = (tipo === 'Recibidos') ? rfcEmisor : rfcReceptor;
+    if (rfcContraparte) { query = query.withRfcMatch(RfcMatch.create(rfcContraparte)); }
 
-    if (!result.getStatus().isAccepted()) {
-        throw new Error(`Fallo al presentar la consulta: ${result.getStatus().getMessage()}`);
+    const errors = query.validate();
+    if (errors.length > 0) throw new Error(`Error de validación: ${errors.map(e => e.getMessage()).join(', ')}`);
+
+    try {
+        const result = await service.query(query);
+        if (!result.getStatus().isAccepted()) throw new Error(`El SAT no aceptó la consulta: ${result.getStatus().getMessage()}`);
+        return { IdSolicitud: result.getRequestId(), CodEstatus: result.getStatus().getCode(), Mensaje: result.getStatus().getMessage(), QueryParams: { ...params } };
+    } catch (e) {
+        if (e.message.includes('Se han agotado las solicitudes')) throw new Error('Límite de solicitudes del SAT alcanzado. Intente más tarde.');
+        throw new Error(`Fallo al presentar la consulta: ${e.message}`);
     }
-
-    console.log(`[LOG] Solicitud de descarga enviada. ID: ${result.getRequestId()}, Encontrados: ${result.getCount()}`);
-    return {
-        IdSolicitud: result.getRequestId(),
-        CodEstatus: result.getStatus().getCode(),
-        Mensaje: result.getStatus().getMessage()
-    };
 }
 
-export async function verificarEstado(token, idSolicitud) {
-    const service = credencialesCache.get(token);
-    if (!service) {
-        throw new Error('Sesión no encontrada.');
-    }
-
-    console.log(`[LOG] Verificando estado de la solicitud: ${idSolicitud}`);
-    const result = await service.verify(idSolicitud);
-
-    if (!result.getStatus().isAccepted()) {
-        throw new Error(`Fallo al verificar la consulta ${idSolicitud}: ${result.getStatus().getMessage()}`);
-    }
-
-    const statusRequest = result.getStatusRequest();
-
-    let response = {
-        EstadoSolicitud: statusRequest.getCode(),
-        CodEstatus: result.getStatus().getCode(),
-        Mensaje: `[${statusRequest.getMessage()}] ${result.getStatus().getMessage()}`,
-        IdsPaquetes: result.getPackageIds() // Devuelve un array vacío si no está lista
-    };
-
-    // Si la solicitud ya terminó, podemos obtener los paquetes directamente
-    if (statusRequest.isFinished()) {
-        console.log(`[LOG] Solicitud ${idSolicitud} finalizada. Obteniendo paquetes...`);
-        const packages = await service.packages(idSolicitud);
-        response.IdsPaquetes = packages.getPackagesIds();
-        console.log(`[LOG] Paquetes encontrados: ${response.IdsPaquetes.join(', ')}`);
-    } else {
-        console.log(`[LOG] Estado de la solicitud ${idSolicitud}: ${statusRequest.getMessage()}`);
-    }
-
-    return response;
+/**
+ * Recupera la instancia del servicio de la caché basándose en el tipo.
+ */
+export function getServiceFromCache(rfc, serviceType = 'cfdi') {
+    return sessionCache.get(`${rfc}_${serviceType}`);
 }
 
-export async function descargarPaquete(token, idPaquete) {
-    const service = credencialesCache.get(token);
-    if (!service) {
-        throw new Error('Sesión no encontrada.');
-    }
+export async function verificarEstado(service, idSolicitud) {
+    const verify = await service.verify(idSolicitud);
+    if (!verify.getStatus().isAccepted()) throw new Error(`Fallo al verificar la consulta ${idSolicitud}: ${verify.getStatus().getMessage()}`);
+    const statusRequest = verify.getStatusRequest();
+    let estadoTexto = 'Desconocido';
+    if (statusRequest.isTypeOf('Accepted')) { estadoTexto = 'Aceptada'; }
+    else if (statusRequest.isTypeOf('InProgress')) { estadoTexto = 'En proceso'; }
+    else if (statusRequest.isTypeOf('Finished')) { estadoTexto = 'Finalizada'; }
+    else if (statusRequest.isTypeOf('Failure')) { estadoTexto = 'Error'; }
+    else if (statusRequest.isTypeOf('Rejected')) { estadoTexto = 'Rechazada'; }
+    else if (statusRequest.isTypeOf('Expired')) { estadoTexto = 'Expirada'; }
+    const codigoEstado = statusRequest.value.code;
+    return { EstadoSolicitud: estadoTexto, CodigoEstado: codigoEstado, CodEstatus: verify.getStatus().getCode(), Mensaje: verify.getStatus().getMessage(), IdsPaquetes: verify.getPackageIds() };
+}
 
-    console.log(`[LOG] Descargando paquete: ${idPaquete}`);
+export async function descargarPaquete(service, idPaquete) {
     const downloadResult = await service.download(idPaquete);
-
-    if (!downloadResult.getStatus().isAccepted()) {
-        throw new Error(`El paquete ${idPaquete} no se ha podido descargar: ${downloadResult.getStatus().getMessage()}`);
-    }
-
-    return Buffer.from(downloadResult.getPackageContent(), 'base64');
-}
-
-export function limpiarCredenciales(token) {
-    credencialesCache.delete(token);
-    console.log(`[LOG] Sesión para RFC ${token} eliminada del caché.`);
-}
-
-export function listarPendientes(listaDeSolicitudes) {
-    if (!Array.isArray(listaDeSolicitudes)) {
-        console.warn("[WARN] listarPendientes recibió un valor que no es un array:", listaDeSolicitudes);
-        return [];
-    }
-    return listaDeSolicitudes.map(solicitud => ({
-        id: solicitud.id
-    }));
+    if (!downloadResult.getStatus().isAccepted()) throw new Error(`El paquete ${idPaquete} no se ha podido descargar: ${downloadResult.getStatus().getMessage()}`);
+    return { fileName: `paquete_${idPaquete}.zip`, content: Buffer.from(downloadResult.getPackageContent(), 'base64') };
 }

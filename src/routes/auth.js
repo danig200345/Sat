@@ -1,15 +1,20 @@
+// file: routes/auth.js
 import { Router } from 'express';
-import { login } from '../services/satClient.js';
+import jwt from 'jsonwebtoken';
+import { createSession } from '../services/satClient.js';
 
 const router = Router();
 
-// POST /api/auth/login
 router.post('/login', async (req, res) => {
     try {
-        const result = await login(req.files, req.body.password);
-        res.json(result);
+        const { rfc } = await createSession(req.files, req.body.password);
+        const payload = { rfc };
+        const token = jwt.sign(payload, process.env.JWT_SECRET, { expiresIn: '8h' });
+        console.log(`[JWT] Token creado para el RFC ${rfc}`);
+        res.json({ success: true, token });
     } catch (error) {
-        res.status(400).json({ error: error.message });
+        console.error('[ERROR LOGIN]', error);
+        res.status(401).json({ error: error.message });
     }
 });
 

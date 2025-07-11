@@ -1,15 +1,19 @@
-import { credencialesCache } from '../routes/cfdis.js';
+// file: middleware/auth.js
+import jwt from 'jsonwebtoken';
 
 export function authenticate(req, res, next) {
-    const auth = req.headers.authorization;
-    if (!auth || !auth.startsWith('Bearer ')) {
-        return res.status(401).json({ error: 'Token Bearer requerido' });
+    const authHeader = req.headers.authorization;
+    if (!authHeader || !authHeader.startsWith('Bearer ')) {
+        return res.status(401).json({ error: 'Acceso no autorizado. Se requiere token Bearer.' });
     }
-    const token = auth.substring(7).trim();
-    if (!credencialesCache.has(token)) {
-        return res.status(401).json({ error: 'Token inválido o expirado' });
-    }
-    req.token = token;
-    req.creds = credencialesCache.get(token);
-    next();
+    const token = authHeader.split(' ')[1];
+    jwt.verify(token, process.env.JWT_SECRET, (err, decoded) => {
+        if (err) {
+            return res.status(401).json({ error: 'Token inválido o expirado.' });
+        }
+
+        // Adjuntamos solo la info del usuario. El servicio se recuperará en la ruta.
+        req.user = { rfc: decoded.rfc };
+        next();
+    });
 }

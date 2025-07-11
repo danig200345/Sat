@@ -1,0 +1,8 @@
+# Evita copiar las dependencias instaladas
+node_modules
+
+# Excluye el historial de Git del contexto de build
+.git
+
+# Impide que cadenas sensibles (API keys, credenciales) se filtren
+.env

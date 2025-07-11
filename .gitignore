@@ -1,0 +1,43 @@
+# Node.js
+/node_modules/
+npm-debug.log*
+yarn-error.log*
+yarn-debug.log*
+*.log
+
+# Build output
+/dist/
+/build/
+/build/Release/
+
+# Coverage
+/coverage/
+/.nyc_output/
+*.lcov
+
+# Runtime data
+pids/
+*.pid
+*.seed
+*.pid.lock
+
+# Environment variables
+.env
+.env.*
+!.env.example
+
+# Docker artifacts
+*.tar
+*.tgz
+
+# VS Code
+.vscode/
+*.code-workspace
+
+# OS and editor files
+.DS_Store
+Thumbs.db
+desktop.ini
+*~
+*.swp
+*.swo
