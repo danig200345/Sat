@@ -1,4 +1,4 @@
-// file: services/satClient.js
+
 import {
     Fiel, Service, HttpsWebClient, FielRequestBuilder, ServiceEndpoints,
     QueryParameters, DateTimePeriod, RequestType, DownloadType, RfcMatch, DocumentType, DocumentStatus

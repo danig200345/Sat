@@ -1,4 +1,4 @@
-// file: routes/auth.js
+
 import { Router } from 'express';
 import jwt from 'jsonwebtoken';
 import { createSession } from '../services/satClient.js';
