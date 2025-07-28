@@ -1,5 +1,5 @@
 
-import 'dotenv/config.js';
+import dotenv from 'dotenv';
 import express from 'express';
 import cors from 'cors';
 import multer from 'multer';
@@ -9,6 +9,7 @@ import cfdiRouter from './routes/cfdis.js';
 
 const upload = multer();
 const app = express();
+dotenv.config();
 
 app.use(cors());
 app.use(express.json());
